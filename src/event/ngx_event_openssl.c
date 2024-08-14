@@ -33,9 +33,6 @@ static int ngx_ssl_new_client_session(ngx_ssl_conn_t *ssl_conn,
 #ifdef SSL_READ_EARLY_DATA_SUCCESS
 static ngx_int_t ngx_ssl_try_early_data(ngx_connection_t *c);
 #endif
-#if (NGX_DEBUG)
-static void ngx_ssl_handshake_log(ngx_connection_t *c);
-#endif
 static void ngx_ssl_handshake_handler(ngx_event_t *ev);
 #ifdef SSL_READ_EARLY_DATA_SUCCESS
 static ssize_t ngx_ssl_recv_early(ngx_connection_t *c, u_char *buf,
@@ -143,12 +140,41 @@ int  ngx_ssl_stapling_index;
 ngx_int_t
 ngx_ssl_init(ngx_log_t *log)
 {
-#if OPENSSL_VERSION_NUMBER >= 0x10100003L
+#if (OPENSSL_INIT_LOAD_CONFIG && !defined LIBRESSL_VERSION_NUMBER)
 
-    if (OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL) == 0) {
+    uint64_t                opts;
+    OPENSSL_INIT_SETTINGS  *init;
+
+    opts = OPENSSL_INIT_LOAD_CONFIG;
+
+#if (NGX_OPENSSL_NO_CONFIG)
+
+    if (getenv("OPENSSL_CONF") == NULL) {
+        opts = OPENSSL_INIT_NO_LOAD_CONFIG;
+    }
+
+#endif
+
+    init = OPENSSL_INIT_new();
+    if (init == NULL) {
+        ngx_ssl_error(NGX_LOG_ALERT, log, 0, "OPENSSL_INIT_new() failed");
+        return NGX_ERROR;
+    }
+
+#ifndef OPENSSL_NO_STDIO
+    if (OPENSSL_INIT_set_config_appname(init, "nginx") == 0) {
+        ngx_ssl_error(NGX_LOG_ALERT, log, 0,
+                      "OPENSSL_INIT_set_config_appname() failed");
+        return NGX_ERROR;
+    }
+#endif
+
+    if (OPENSSL_init_ssl(opts, init) == 0) {
         ngx_ssl_error(NGX_LOG_ALERT, log, 0, "OPENSSL_init_ssl() failed");
         return NGX_ERROR;
     }
+
+    OPENSSL_INIT_free(init);
 
     /*
      * OPENSSL_init_ssl() may leave errors in the error queue
@@ -159,7 +185,15 @@ ngx_ssl_init(ngx_log_t *log)
 
 #else
 
-    OPENSSL_config(NULL);
+#if (NGX_OPENSSL_NO_CONFIG)
+
+    if (getenv("OPENSSL_CONF") == NULL) {
+        OPENSSL_no_config();
+    }
+
+#endif
+
+    OPENSSL_config("nginx");
 
     SSL_library_init();
     SSL_load_error_strings();
@@ -1880,6 +1914,31 @@ ngx_ssl_handshake(ngx_connection_t *c)
         return NGX_AGAIN;
     }
 
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+    if (sslerr == SSL_ERROR_WANT_X509_LOOKUP
+#   ifdef SSL_ERROR_PENDING_SESSION
+        || sslerr == SSL_ERROR_PENDING_SESSION
+#   endif
+#   ifdef SSL_ERROR_WANT_CLIENT_HELLO_CB
+        || sslerr == SSL_ERROR_WANT_CLIENT_HELLO_CB
+#   endif
+       )
+    {
+        c->read->handler = ngx_ssl_handshake_handler;
+        c->write->handler = ngx_ssl_handshake_handler;
+
+        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+#endif
+
     err = (sslerr == SSL_ERROR_SYSCALL) ? ngx_errno : 0;
 
     c->ssl->no_wait_shutdown = 1;
@@ -2027,6 +2086,55 @@ ngx_ssl_try_early_data(ngx_connection_t *c)
         return NGX_AGAIN;
     }
 
+    if (sslerr == SSL_ERROR_WANT_X509_LOOKUP) {
+        c->read->handler = ngx_ssl_handshake_handler;
+        c->write->handler = ngx_ssl_handshake_handler;
+
+        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+
+#ifdef SSL_ERROR_PENDING_SESSION
+    if (sslerr == SSL_ERROR_PENDING_SESSION) {
+        c->read->handler = ngx_ssl_handshake_handler;
+        c->write->handler = ngx_ssl_handshake_handler;
+
+        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+#endif
+
+#ifdef SSL_ERROR_WANT_CLIENT_HELLO_CB
+    if (sslerr == SSL_ERROR_WANT_CLIENT_HELLO_CB) {
+        c->read->handler = ngx_ssl_handshake_handler;
+        c->write->handler = ngx_ssl_handshake_handler;
+
+        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+#endif
+
     err = (sslerr == SSL_ERROR_SYSCALL) ? ngx_errno : 0;
 
     c->ssl->no_wait_shutdown = 1;
@@ -2052,7 +2160,7 @@ ngx_ssl_try_early_data(ngx_connection_t *c)
 
 #if (NGX_DEBUG)
 
-static void
+void
 ngx_ssl_handshake_log(ngx_connection_t *c)
 {
     char         buf[129], *s, *d;
@@ -3202,6 +3310,13 @@ ngx_ssl_shutdown(ngx_connection_t *c)
     ngx_err_t   err;
     ngx_uint_t  tries;
 
+#if (NGX_QUIC)
+    if (c->quic) {
+        /* QUIC streams inherit SSL object */
+        return NGX_OK;
+    }
+#endif
+
     rc = NGX_OK;
 
     ngx_ssl_ocsp_cleanup(c);
@@ -3389,12 +3504,15 @@ ngx_ssl_connection_error(ngx_connection_t *c, int sslerr, ngx_err_t err,
 
     } else if (sslerr == SSL_ERROR_SSL) {
 
-        n = ERR_GET_REASON(ERR_peek_error());
+        n = ERR_GET_REASON(ERR_peek_last_error());
 
             /* handshake failures */
         if (n == SSL_R_BAD_CHANGE_CIPHER_SPEC                        /*  103 */
 #ifdef SSL_R_NO_SUITABLE_KEY_SHARE
             || n == SSL_R_NO_SUITABLE_KEY_SHARE                      /*  101 */
+#endif
+#ifdef SSL_R_BAD_ALERT
+            || n == SSL_R_BAD_ALERT                                  /*  102 */
 #endif
 #ifdef SSL_R_BAD_KEY_SHARE
             || n == SSL_R_BAD_KEY_SHARE                              /*  108 */
@@ -3402,16 +3520,42 @@ ngx_ssl_connection_error(ngx_connection_t *c, int sslerr, ngx_err_t err,
 #ifdef SSL_R_BAD_EXTENSION
             || n == SSL_R_BAD_EXTENSION                              /*  110 */
 #endif
+            || n == SSL_R_BAD_DIGEST_LENGTH                          /*  111 */
+#ifdef SSL_R_MISSING_SIGALGS_EXTENSION
+            || n == SSL_R_MISSING_SIGALGS_EXTENSION                  /*  112 */
+#endif
+            || n == SSL_R_BAD_PACKET_LENGTH                          /*  115 */
 #ifdef SSL_R_NO_SUITABLE_SIGNATURE_ALGORITHM
             || n == SSL_R_NO_SUITABLE_SIGNATURE_ALGORITHM            /*  118 */
 #endif
+#ifdef SSL_R_BAD_KEY_UPDATE
+            || n == SSL_R_BAD_KEY_UPDATE                             /*  122 */
+#endif
             || n == SSL_R_BLOCK_CIPHER_PAD_IS_WRONG                  /*  129 */
+            || n == SSL_R_CCS_RECEIVED_EARLY                         /*  133 */
+#ifdef SSL_R_DECODE_ERROR
+            || n == SSL_R_DECODE_ERROR                               /*  137 */
+#endif
+#ifdef SSL_R_DATA_BETWEEN_CCS_AND_FINISHED
+            || n == SSL_R_DATA_BETWEEN_CCS_AND_FINISHED              /*  145 */
+#endif
+            || n == SSL_R_DATA_LENGTH_TOO_LONG                       /*  146 */
             || n == SSL_R_DIGEST_CHECK_FAILED                        /*  149 */
+            || n == SSL_R_ENCRYPTED_LENGTH_TOO_LONG                  /*  150 */
             || n == SSL_R_ERROR_IN_RECEIVED_CIPHER_LIST              /*  151 */
             || n == SSL_R_EXCESSIVE_MESSAGE_SIZE                     /*  152 */
+#ifdef SSL_R_GOT_A_FIN_BEFORE_A_CCS
+            || n == SSL_R_GOT_A_FIN_BEFORE_A_CCS                     /*  154 */
+#endif
             || n == SSL_R_HTTPS_PROXY_REQUEST                        /*  155 */
             || n == SSL_R_HTTP_REQUEST                               /*  156 */
             || n == SSL_R_LENGTH_MISMATCH                            /*  159 */
+#ifdef SSL_R_LENGTH_TOO_SHORT
+            || n == SSL_R_LENGTH_TOO_SHORT                           /*  160 */
+#endif
+#ifdef SSL_R_NO_RENEGOTIATION
+            || n == SSL_R_NO_RENEGOTIATION                           /*  182 */
+#endif
 #ifdef SSL_R_NO_CIPHERS_PASSED
             || n == SSL_R_NO_CIPHERS_PASSED                          /*  182 */
 #endif
@@ -3421,7 +3565,13 @@ ngx_ssl_connection_error(ngx_connection_t *c, int sslerr, ngx_err_t err,
 #endif
             || n == SSL_R_NO_COMPRESSION_SPECIFIED                   /*  187 */
             || n == SSL_R_NO_SHARED_CIPHER                           /*  193 */
+#ifdef SSL_R_PACKET_LENGTH_TOO_LONG
+            || n == SSL_R_PACKET_LENGTH_TOO_LONG                     /*  198 */
+#endif
             || n == SSL_R_RECORD_LENGTH_MISMATCH                     /*  213 */
+#ifdef SSL_R_TOO_MANY_WARNING_ALERTS
+            || n == SSL_R_TOO_MANY_WARNING_ALERTS                    /*  220 */
+#endif
 #ifdef SSL_R_CLIENTHELLO_TLSEXT
             || n == SSL_R_CLIENTHELLO_TLSEXT                         /*  226 */
 #endif
@@ -3430,6 +3580,9 @@ ngx_ssl_connection_error(ngx_connection_t *c, int sslerr, ngx_err_t err,
 #endif
 #ifdef SSL_R_CALLBACK_FAILED
             || n == SSL_R_CALLBACK_FAILED                            /*  234 */
+#endif
+#ifdef SSL_R_TLS_RSA_ENCRYPTED_VALUE_LENGTH_IS_WRONG
+            || n == SSL_R_TLS_RSA_ENCRYPTED_VALUE_LENGTH_IS_WRONG    /*  234 */
 #endif
 #ifdef SSL_R_NO_APPLICATION_PROTOCOL
             || n == SSL_R_NO_APPLICATION_PROTOCOL                    /*  235 */
@@ -3441,17 +3594,39 @@ ngx_ssl_connection_error(ngx_connection_t *c, int sslerr, ngx_err_t err,
 #ifdef SSL_R_NO_COMMON_SIGNATURE_ALGORITHMS
             || n == SSL_R_NO_COMMON_SIGNATURE_ALGORITHMS             /*  253 */
 #endif
+#ifdef SSL_R_INVALID_COMPRESSION_LIST
+            || n == SSL_R_INVALID_COMPRESSION_LIST                   /*  256 */
+#endif
+#ifdef SSL_R_MISSING_KEY_SHARE
+            || n == SSL_R_MISSING_KEY_SHARE                          /*  258 */
+#endif
             || n == SSL_R_UNSUPPORTED_PROTOCOL                       /*  258 */
 #ifdef SSL_R_NO_SHARED_GROUP
             || n == SSL_R_NO_SHARED_GROUP                            /*  266 */
 #endif
             || n == SSL_R_WRONG_VERSION_NUMBER                       /*  267 */
+#ifdef SSL_R_TOO_MUCH_SKIPPED_EARLY_DATA
+            || n == SSL_R_TOO_MUCH_SKIPPED_EARLY_DATA                /*  270 */
+#endif
+            || n == SSL_R_BAD_LENGTH                                 /*  271 */
             || n == SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC        /*  281 */
 #ifdef SSL_R_APPLICATION_DATA_AFTER_CLOSE_NOTIFY
             || n == SSL_R_APPLICATION_DATA_AFTER_CLOSE_NOTIFY        /*  291 */
 #endif
 #ifdef SSL_R_APPLICATION_DATA_ON_SHUTDOWN
             || n == SSL_R_APPLICATION_DATA_ON_SHUTDOWN               /*  291 */
+#endif
+#ifdef SSL_R_BAD_LEGACY_VERSION
+            || n == SSL_R_BAD_LEGACY_VERSION                         /*  292 */
+#endif
+#ifdef SSL_R_MIXED_HANDSHAKE_AND_NON_HANDSHAKE_DATA
+            || n == SSL_R_MIXED_HANDSHAKE_AND_NON_HANDSHAKE_DATA     /*  293 */
+#endif
+#ifdef SSL_R_RECORD_TOO_SMALL
+            || n == SSL_R_RECORD_TOO_SMALL                           /*  298 */
+#endif
+#ifdef SSL_R_SSL3_SESSION_ID_TOO_LONG
+            || n == SSL_R_SSL3_SESSION_ID_TOO_LONG                   /*  300 */
 #endif
 #ifdef SSL_R_BAD_ECPOINT
             || n == SSL_R_BAD_ECPOINT                                /*  306 */
@@ -3470,11 +3645,20 @@ ngx_ssl_connection_error(ngx_connection_t *c, int sslerr, ngx_err_t err,
 #ifdef SSL_R_INAPPROPRIATE_FALLBACK
             || n == SSL_R_INAPPROPRIATE_FALLBACK                     /*  373 */
 #endif
+#ifdef SSL_R_NO_SHARED_SIGNATURE_ALGORITHMS
+            || n == SSL_R_NO_SHARED_SIGNATURE_ALGORITHMS             /*  376 */
+#endif
+#ifdef SSL_R_NO_SHARED_SIGATURE_ALGORITHMS
+            || n == SSL_R_NO_SHARED_SIGATURE_ALGORITHMS              /*  376 */
+#endif
 #ifdef SSL_R_CERT_CB_ERROR
             || n == SSL_R_CERT_CB_ERROR                              /*  377 */
 #endif
 #ifdef SSL_R_VERSION_TOO_LOW
             || n == SSL_R_VERSION_TOO_LOW                            /*  396 */
+#endif
+#ifdef SSL_R_TOO_MANY_WARN_ALERTS
+            || n == SSL_R_TOO_MANY_WARN_ALERTS                       /*  409 */
 #endif
 #ifdef SSL_R_BAD_RECORD_TYPE
             || n == SSL_R_BAD_RECORD_TYPE                            /*  443 */

@@ -64,6 +64,8 @@ static char *ngx_http_core_directio(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_core_error_page(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_core_no_error_pages(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static char *ngx_http_core_open_file_cache(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_core_error_log(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -667,6 +669,14 @@ static ngx_command_t  ngx_http_core_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF
                         |NGX_CONF_2MORE,
       ngx_http_core_error_page,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("no_error_pages"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF
+                        |NGX_CONF_NOARGS,
+      ngx_http_core_no_error_pages,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -1803,10 +1813,6 @@ ngx_http_send_response(ngx_http_request_t *r, ngx_uint_t status,
         }
     }
 
-    if (r != r->main && val.len == 0) {
-        return ngx_http_send_header(r);
-    }
-
     b = ngx_calloc_buf(r->pool);
     if (b == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -1817,6 +1823,7 @@ ngx_http_send_response(ngx_http_request_t *r, ngx_uint_t status,
     b->memory = val.len ? 1 : 0;
     b->last_buf = (r == r->main) ? 1 : 0;
     b->last_in_chain = 1;
+    b->sync = (b->last_buf || b->memory) ? 0 : 1;
 
     out.buf = b;
     out.next = NULL;
@@ -3008,6 +3015,7 @@ ngx_http_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy)
         lsopt.socklen = sizeof(struct sockaddr_in);
 
         lsopt.backlog = NGX_LISTEN_BACKLOG;
+        lsopt.type = SOCK_STREAM;
         lsopt.rcvbuf = -1;
         lsopt.sndbuf = -1;
 #if (NGX_HAVE_SETFIB)
@@ -3566,7 +3574,6 @@ ngx_http_core_create_loc_conf(ngx_conf_t *cf)
      *     clcf->types = NULL;
      *     clcf->default_type = { 0, NULL };
      *     clcf->error_log = NULL;
-     *     clcf->error_pages = NULL;
      *     clcf->client_body_path = NULL;
      *     clcf->regex = NULL;
      *     clcf->exact_match = 0;
@@ -3576,6 +3583,7 @@ ngx_http_core_create_loc_conf(ngx_conf_t *cf)
      *     clcf->keepalive_disable = 0;
      */
 
+    clcf->error_pages = NGX_CONF_UNSET_PTR;
     clcf->client_max_body_size = NGX_CONF_UNSET;
     clcf->client_body_buffer_size = NGX_CONF_UNSET_SIZE;
     clcf->client_body_timeout = NGX_CONF_UNSET_MSEC;
@@ -3778,9 +3786,7 @@ ngx_http_core_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         }
     }
 
-    if (conf->error_pages == NULL && prev->error_pages) {
-        conf->error_pages = prev->error_pages;
-    }
+    ngx_conf_merge_ptr_value(conf->error_pages, prev->error_pages, NULL);
 
     ngx_conf_merge_str_value(conf->default_type,
                               prev->default_type, "text/plain");
@@ -3989,6 +3995,7 @@ ngx_http_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_memzero(&lsopt, sizeof(ngx_http_listen_opt_t));
 
     lsopt.backlog = NGX_LISTEN_BACKLOG;
+    lsopt.type = SOCK_STREAM;
     lsopt.rcvbuf = -1;
     lsopt.sndbuf = -1;
 #if (NGX_HAVE_SETFIB)
@@ -4177,12 +4184,30 @@ ngx_http_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         if (ngx_strcmp(value[n].data, "http2") == 0) {
 #if (NGX_HTTP_V2)
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "the \"listen ... http2\" directive "
+                               "is deprecated, use "
+                               "the \"http2\" directive instead");
+
             lsopt.http2 = 1;
             continue;
 #else
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "the \"http2\" parameter requires "
                                "ngx_http_v2_module");
+            return NGX_CONF_ERROR;
+#endif
+        }
+
+        if (ngx_strcmp(value[n].data, "quic") == 0) {
+#if (NGX_HTTP_V3)
+            lsopt.quic = 1;
+            lsopt.type = SOCK_DGRAM;
+            continue;
+#else
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "the \"quic\" parameter requires "
+                               "ngx_http_v3_module");
             return NGX_CONF_ERROR;
 #endif
         }
@@ -4287,6 +4312,28 @@ ngx_http_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            "invalid parameter \"%V\"", &value[n]);
         return NGX_CONF_ERROR;
     }
+
+#if (NGX_HTTP_V3)
+
+    if (lsopt.quic) {
+#if (NGX_HTTP_SSL)
+        if (lsopt.ssl) {
+            return "\"ssl\" parameter is incompatible with \"quic\"";
+        }
+#endif
+
+#if (NGX_HTTP_V2)
+        if (lsopt.http2) {
+            return "\"http2\" parameter is incompatible with \"quic\"";
+        }
+#endif
+
+        if (lsopt.proxy_protocol) {
+            return "\"proxy_protocol\" parameter is incompatible with \"quic\"";
+        }
+    }
+
+#endif
 
     for (n = 0; n < u.naddrs; n++) {
 
@@ -4776,6 +4823,10 @@ ngx_http_core_error_page(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_http_compile_complex_value_t   ccv;
 
     if (clcf->error_pages == NULL) {
+        return "conflicts with \"no_error_pages\"";
+    }
+
+    if (clcf->error_pages == NGX_CONF_UNSET_PTR) {
         clcf->error_pages = ngx_array_create(cf->pool, 4,
                                              sizeof(ngx_http_err_page_t));
         if (clcf->error_pages == NULL) {
@@ -4876,6 +4927,25 @@ ngx_http_core_error_page(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         err->value = cv;
         err->args = args;
     }
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_http_core_no_error_pages(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_core_loc_conf_t *clcf = conf;
+
+    if (clcf->error_pages == NULL) {
+        return "is duplicate";
+    }
+
+    if (clcf->error_pages != NGX_CONF_UNSET_PTR) {
+        return "conflicts with \"error_page\"";
+    }
+
+    clcf->error_pages = NULL;
 
     return NGX_CONF_OK;
 }
